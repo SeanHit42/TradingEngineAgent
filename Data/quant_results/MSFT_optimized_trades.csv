@@ -1,0 +1,3 @@
+side,signal_bar_date,entry_date,exit_date,entry_price,initial_stop,final_stop,tp1_price,tp2_price,tp3_price,shares_total,tp_hits,exit_reason,gross_pnl,total_fees,net_pnl,holding_days
+long,2020-11-04,2020-11-05,2020-11-10,222.04,216.0607,222.04,228.0193,236.9882,239.9778,16,1,stop,35.8757,3.5706,32.3051,5
+short,2022-12-15,2022-12-16,2023-01-04,248.55,255.9657,241.1343,241.1343,230.0107,226.3029,13,3,tp_complete,200.2243,3.131,197.0933,19

@@ -1,0 +1,2 @@
+side,signal_bar_date,entry_date,exit_date,entry_price,initial_stop,final_stop,tp1_price,tp2_price,tp3_price,shares_total,tp_hits,exit_reason,gross_pnl,total_fees,net_pnl,holding_days
+long,2021-03-09,2021-03-10,2021-05-10,316.16,306.595,325.725,325.725,340.0725,344.855,10,2,stop,138.6924,3.2309,135.4615,61

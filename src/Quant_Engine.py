@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from itertools import product
+from dataclasses import dataclass
 import math
 import warnings
-from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -17,10 +17,11 @@ warnings.simplefilter("ignore", FutureWarning)
 # =========================================================
 
 RAW_DIR = Path("data/raw")
-OUTPUT_DIR = Path("data/quant_results")
+OUTPUT_DIR = Path("data/quant_results_v2")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TICKERS = ["AAPL", "MSFT", "NVDA", "SPY", "QQQ"]
+# SPY משמש רק כ-regime filter, לא כנכס נסחר
+TICKERS = ["AAPL", "MSFT", "NVDA", "QQQ"]
 REGIME_TICKER = "SPY"
 
 INITIAL_CAPITAL = 10_000.0
@@ -33,18 +34,30 @@ LONG_SLOW_LEVEL = 50
 SHORT_FAST_LEVEL = 70
 SHORT_SLOW_LEVEL = 50
 
+# ===== Parameter Grid =====
 FAST_WINDOWS = [14, 21, 30, 42]
 SLOW_WINDOWS = [42, 55, 84]
 ATR_WINDOWS = [14]
+
 STOP_ATR_MULTS = [0.8, 1.0]
 TP1_MULTS = [1.0, 1.5]
 TP2_MULTS = [2.0, 2.5]
 TP3_MULTS = [3.0, 4.0]
+
 REGIME_MA_WINDOWS = [100, 150, 200]
 MIN_ATR_PCTS = [0.015, 0.02, 0.025]
 
-MIN_TRADES_PER_TICKER = 5
+SWEEP_LOOKBACKS = [5, 10, 20]
+REQUIRE_SWEEP_OPTIONS = [True, False]
+
+MIN_TRADES_PER_TICKER = 10
+MIN_VALID_TICKERS = 3
+MIN_AVG_RR = 1.2
+
 TOP_N_RESULTS = 15
+
+MONTE_CARLO_SIMS = 2000
+MONTE_CARLO_SEED = 42
 
 
 # =========================================================
@@ -62,6 +75,8 @@ class StrategyParams:
     tp3_mult: float
     regime_ma_window: int
     min_atr_pct: float
+    sweep_lookback: int
+    require_sweep: bool
 
 
 # =========================================================
@@ -70,7 +85,7 @@ class StrategyParams:
 
 def validate_ohlcv(df: pd.DataFrame) -> None:
     required_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    missing = [col for col in required_cols if col not in df.columns]
+    missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
     if df.empty:
@@ -106,20 +121,14 @@ def compute_position_size(equity: float, entry_price: float, stop_price: float) 
 
     raw_shares = math.floor(risk_dollars / stop_distance)
     max_affordable = math.floor(equity / entry_price) if entry_price > 0 else 0
-
     return max(0, min(raw_shares, max_affordable))
 
 
 # =========================================================
-# INDICATORS
+# INDICATORS / FEATURES
 # =========================================================
 
-def williams_r_normalized(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    window: int,
-) -> pd.Series:
+def williams_r_normalized(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
     highest_high = high.rolling(window).max()
     lowest_low = low.rolling(window).min()
     denom = (highest_high - lowest_low).replace(0, np.nan)
@@ -140,6 +149,16 @@ def compute_regime_ma(close: pd.Series, window: int) -> pd.Series:
     return close.rolling(window).mean()
 
 
+def compute_liquidity_sweeps(df: pd.DataFrame, lookback: int) -> Tuple[pd.Series, pd.Series]:
+    prev_low = df["Low"].rolling(lookback).min().shift(1)
+    prev_high = df["High"].rolling(lookback).max().shift(1)
+
+    bullish_sweep = (df["Low"] < prev_low) & (df["Close"] > prev_low)
+    bearish_sweep = (df["High"] > prev_high) & (df["Close"] < prev_high)
+
+    return bullish_sweep, bearish_sweep
+
+
 # =========================================================
 # LOADING + FEATURE STORE
 # =========================================================
@@ -151,70 +170,48 @@ def load_raw_ticker_data(ticker: str) -> pd.DataFrame:
 
     df = pd.read_parquet(file_path)
     validate_ohlcv(df)
-
     df = df.sort_values("Date").reset_index(drop=True).copy()
     df["Date"] = pd.to_datetime(df["Date"])
     return df
 
 
 def load_all_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    for ticker in tickers:
-        out[ticker] = load_raw_ticker_data(ticker)
-    return out
+    return {ticker: load_raw_ticker_data(ticker) for ticker in tickers}
 
 
-def build_feature_store(
-    market_data: Dict[str, pd.DataFrame],
-) -> Dict[str, pd.DataFrame]:
-    """
-    מחשב מראש את כל הפיצ'רים האפשריים שנצטרך,
-    כדי לא לחשב אותם מחדש בכל קומבינציה.
-    """
+def build_feature_store(market_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     all_williams_windows = sorted(set(FAST_WINDOWS + SLOW_WINDOWS))
     all_atr_windows = sorted(set(ATR_WINDOWS))
     all_regime_windows = sorted(set(REGIME_MA_WINDOWS))
+    all_sweep_lookbacks = sorted(set(SWEEP_LOOKBACKS))
 
-    feature_store: Dict[str, pd.DataFrame] = {}
+    store: Dict[str, pd.DataFrame] = {}
 
     for ticker, df in market_data.items():
         feat = df.copy()
-
-        # returns
         feat["returns"] = feat["Close"].pct_change().fillna(0)
 
-        # Williams
         for w in all_williams_windows:
-            feat[f"willi_{w}"] = williams_r_normalized(
-                feat["High"], feat["Low"], feat["Close"], w
-            )
+            feat[f"willi_{w}"] = williams_r_normalized(feat["High"], feat["Low"], feat["Close"], w)
 
-        # ATR + ATR%
         for w in all_atr_windows:
             atr = compute_atr(feat, w)
             feat[f"atr_{w}"] = atr
             feat[f"atr_pct_{w}"] = atr / feat["Close"]
 
-        # regime MA for SPY reference only
+        for lb in all_sweep_lookbacks:
+            bull_sweep, bear_sweep = compute_liquidity_sweeps(feat, lb)
+            feat[f"bull_sweep_{lb}"] = bull_sweep
+            feat[f"bear_sweep_{lb}"] = bear_sweep
+
         if ticker == REGIME_TICKER:
             for w in all_regime_windows:
                 feat[f"regime_ma_{w}"] = compute_regime_ma(feat["Close"], w)
                 feat[f"bull_regime_{w}"] = feat["Close"] > feat[f"regime_ma_{w}"]
 
-        feature_store[ticker] = feat
+        store[ticker] = feat
 
-    return feature_store
-
-
-def merge_regime(asset_df: pd.DataFrame, regime_df: pd.DataFrame, regime_col: str) -> pd.DataFrame:
-    merged = asset_df.merge(
-        regime_df[["Date", regime_col]],
-        on="Date",
-        how="left",
-    )
-    merged[regime_col] = merged[regime_col].where(merged[regime_col].notna(), False)
-    merged[regime_col] = merged[regime_col].astype(bool)
-    return merged
+    return store
 
 
 def build_dataset_for_params(
@@ -229,18 +226,20 @@ def build_dataset_for_params(
     slow_col = f"willi_{params.slow_window}"
     atr_col = f"atr_{params.atr_window}"
     atr_pct_col = f"atr_pct_{params.atr_window}"
+    bull_sweep_col = f"bull_sweep_{params.sweep_lookback}"
+    bear_sweep_col = f"bear_sweep_{params.sweep_lookback}"
+    regime_ma_col = f"regime_ma_{params.regime_ma_window}"
     regime_col = f"bull_regime_{params.regime_ma_window}"
 
-    if fast_col not in asset_df.columns:
-        raise ValueError(f"Missing column {fast_col} for {ticker}")
-    if slow_col not in asset_df.columns:
-        raise ValueError(f"Missing column {slow_col} for {ticker}")
-    if atr_col not in asset_df.columns:
-        raise ValueError(f"Missing column {atr_col} for {ticker}")
-    if atr_pct_col not in asset_df.columns:
-        raise ValueError(f"Missing column {atr_pct_col} for {ticker}")
+    required_asset_cols = [fast_col, slow_col, atr_col, atr_pct_col, bull_sweep_col, bear_sweep_col]
+    for col in required_asset_cols:
+        if col not in asset_df.columns:
+            raise ValueError(f"Missing asset column {col} for {ticker}")
+
+    if regime_ma_col not in regime_df.columns:
+        regime_df[regime_ma_col] = compute_regime_ma(regime_df["Close"], params.regime_ma_window)
     if regime_col not in regime_df.columns:
-        raise ValueError(f"Missing regime column {regime_col} for {REGIME_TICKER}")
+        regime_df[regime_col] = regime_df["Close"] > regime_df[regime_ma_col]
 
     asset_df = asset_df.rename(
         columns={
@@ -248,15 +247,26 @@ def build_dataset_for_params(
             slow_col: "willi_slow",
             atr_col: "atr",
             atr_pct_col: "atr_pct",
+            bull_sweep_col: "bull_sweep",
+            bear_sweep_col: "bear_sweep",
         }
     )
 
-    merged = merge_regime(asset_df, regime_df, regime_col=regime_col)
-    merged = merged.rename(columns={regime_col: "bull_regime"})
+    # avoid x/y duplication when ticker == SPY
+    cols_to_drop = [c for c in [regime_col, "bull_regime"] if c in asset_df.columns]
+    if cols_to_drop:
+        asset_df = asset_df.drop(columns=cols_to_drop)
+
+    regime_subset = regime_df[["Date", regime_col]].copy()
+
+    merged = asset_df.merge(regime_subset, on="Date", how="left")
+    merged[regime_col] = merged[regime_col].where(merged[regime_col].notna(), False)
+    merged["bull_regime"] = merged[regime_col].astype(bool)
 
     needed = [
         "Date", "Open", "High", "Low", "Close", "Volume",
-        "returns", "willi_fast", "willi_slow", "atr", "atr_pct", "bull_regime",
+        "returns", "willi_fast", "willi_slow", "atr", "atr_pct",
+        "bull_sweep", "bear_sweep", "bull_regime",
     ]
     merged = merged[needed].dropna().reset_index(drop=True)
 
@@ -267,22 +277,28 @@ def build_dataset_for_params(
 # SIGNALS
 # =========================================================
 
-def is_long_signal(prev_row: pd.Series, signal_row: pd.Series) -> bool:
-    return (
+def is_long_signal(prev_row: pd.Series, signal_row: pd.Series, require_sweep: bool) -> bool:
+    cond = (
         crossed_above(prev_row["willi_fast"], signal_row["willi_fast"], LONG_FAST_LEVEL)
         and crossed_above(prev_row["willi_slow"], signal_row["willi_slow"], LONG_SLOW_LEVEL)
     )
+    if require_sweep:
+        cond = cond and bool(signal_row["bull_sweep"])
+    return cond
 
 
-def is_short_signal(prev_row: pd.Series, signal_row: pd.Series) -> bool:
-    return (
+def is_short_signal(prev_row: pd.Series, signal_row: pd.Series, require_sweep: bool) -> bool:
+    cond = (
         crossed_below(prev_row["willi_fast"], signal_row["willi_fast"], SHORT_FAST_LEVEL)
         and crossed_below(prev_row["willi_slow"], signal_row["willi_slow"], SHORT_SLOW_LEVEL)
     )
+    if require_sweep:
+        cond = cond and bool(signal_row["bear_sweep"])
+    return cond
 
 
 # =========================================================
-# TRADE OBJECT HELPERS
+# TRADE HELPERS
 # =========================================================
 
 def create_trade(
@@ -351,13 +367,7 @@ def create_trade(
     }
 
 
-def close_tranche(
-    trade: dict,
-    tranche_idx: int,
-    exit_price: float,
-    exit_date,
-    exit_reason: str,
-) -> None:
+def close_tranche(trade: dict, tranche_idx: int, exit_price: float, exit_date, exit_reason: str) -> None:
     tranche = trade["tranches"][tranche_idx]
     if not tranche["is_open"] or tranche["qty"] == 0:
         return
@@ -445,7 +455,7 @@ def handle_open_trade_for_bar(trade: dict, row: pd.Series) -> None:
     else:
         stop_hit = current_high >= trade["current_stop"]
 
-    # conservative daily rule: stop first
+    # conservative intrabar rule: stop first
     if stop_hit:
         for idx in open_indices:
             close_tranche(trade, idx, trade["current_stop"], current_date, "stop")
@@ -453,7 +463,6 @@ def handle_open_trade_for_bar(trade: dict, row: pd.Series) -> None:
         trade["exit_reason"] = "stop"
         return
 
-    # then targets
     for idx in open_indices:
         tranche = trade["tranches"][idx]
         tp_price = tranche["tp_price"]
@@ -476,9 +485,7 @@ def handle_open_trade_for_bar(trade: dict, row: pd.Series) -> None:
 
 def run_backtest(
     df: pd.DataFrame,
-    stop_atr_mult: float,
-    tp_mults: Tuple[float, float, float],
-    min_atr_pct: float,
+    params: StrategyParams,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = df.sort_values("Date").reset_index(drop=True).copy()
 
@@ -499,10 +506,10 @@ def run_backtest(
             signal_row = df.iloc[i - 1]
             prev_signal_row = df.iloc[i - 2]
 
-            long_signal = is_long_signal(prev_signal_row, signal_row)
-            short_signal = is_short_signal(prev_signal_row, signal_row)
+            long_signal = is_long_signal(prev_signal_row, signal_row, params.require_sweep)
+            short_signal = is_short_signal(prev_signal_row, signal_row, params.require_sweep)
 
-            volatility_ok = signal_row["atr_pct"] >= min_atr_pct
+            volatility_ok = signal_row["atr_pct"] >= params.min_atr_pct
             bull_regime = bool(signal_row["bull_regime"])
 
             allow_long = bull_regime and volatility_ok
@@ -518,7 +525,7 @@ def run_backtest(
             if side is not None:
                 entry_price = float(row["Open"])
                 atr = float(signal_row["atr"])
-                stop_price = entry_price - stop_atr_mult * atr if side == "long" else entry_price + stop_atr_mult * atr
+                stop_price = entry_price - params.stop_atr_mult * atr if side == "long" else entry_price + params.stop_atr_mult * atr
                 shares_total = compute_position_size(cash, entry_price, stop_price)
 
                 if shares_total > 0:
@@ -529,8 +536,8 @@ def run_backtest(
                         entry_price=entry_price,
                         atr=atr,
                         shares_total=shares_total,
-                        stop_atr_mult=stop_atr_mult,
-                        tp_mults=tp_mults,
+                        stop_atr_mult=params.stop_atr_mult,
+                        tp_mults=(params.tp1_mult, params.tp2_mult, params.tp3_mult),
                     )
 
                     if side == "long":
@@ -604,6 +611,58 @@ def run_backtest(
 
 
 # =========================================================
+# MONTE CARLO ROBUSTNESS
+# =========================================================
+
+def monte_carlo_trade_bootstrap(
+    trades_df: pd.DataFrame,
+    initial_capital: float = INITIAL_CAPITAL,
+    n_sims: int = MONTE_CARLO_SIMS,
+    seed: int = MONTE_CARLO_SEED,
+) -> dict:
+    if trades_df.empty or "net_pnl" not in trades_df.columns:
+        return {
+            "mc_median_final_equity": initial_capital,
+            "mc_p05_final_equity": initial_capital,
+            "mc_p95_final_equity": initial_capital,
+            "mc_prob_profit_%": 0.0,
+            "mc_median_return_%": 0.0,
+            "mc_p05_return_%": 0.0,
+            "mc_p95_return_%": 0.0,
+            "mc_median_max_dd_%": 0.0,
+        }
+
+    rng = np.random.default_rng(seed)
+    trade_pnls = trades_df["net_pnl"].to_numpy(dtype=float)
+    n_trades = len(trade_pnls)
+
+    final_equities = np.zeros(n_sims, dtype=float)
+    max_dds = np.zeros(n_sims, dtype=float)
+
+    for i in range(n_sims):
+        sampled = rng.choice(trade_pnls, size=n_trades, replace=True)
+        equity_path = initial_capital + np.cumsum(sampled)
+        rolling_max = np.maximum.accumulate(equity_path)
+        dd = (equity_path / rolling_max - 1.0) * 100.0
+
+        final_equities[i] = equity_path[-1]
+        max_dds[i] = np.min(dd)
+
+    returns_pct = (final_equities / initial_capital - 1.0) * 100.0
+
+    return {
+        "mc_median_final_equity": round(float(np.median(final_equities)), 2),
+        "mc_p05_final_equity": round(float(np.percentile(final_equities, 5)), 2),
+        "mc_p95_final_equity": round(float(np.percentile(final_equities, 95)), 2),
+        "mc_prob_profit_%": round(float(np.mean(final_equities > initial_capital) * 100.0), 2),
+        "mc_median_return_%": round(float(np.median(returns_pct)), 2),
+        "mc_p05_return_%": round(float(np.percentile(returns_pct, 5)), 2),
+        "mc_p95_return_%": round(float(np.percentile(returns_pct, 95)), 2),
+        "mc_median_max_dd_%": round(float(np.median(max_dds)), 2),
+    }
+
+
+# =========================================================
 # SUMMARY / SCORING
 # =========================================================
 
@@ -615,7 +674,7 @@ def build_trade_summary(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> dic
     num_trades = len(trades_df)
 
     if num_trades == 0:
-        return {
+        base = {
             "strategy_return_%": round(strategy_return_pct, 2),
             "buy_hold_%": round(buy_hold_return_pct, 2),
             "max_drawdown_%": round(max_drawdown_pct, 2),
@@ -627,6 +686,8 @@ def build_trade_summary(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> dic
             "profit_factor": 0.0,
             "expectancy_$": 0.0,
         }
+        base.update(monte_carlo_trade_bootstrap(trades_df))
+        return base
 
     wins = trades_df[trades_df["net_pnl"] > 0]
     losses = trades_df[trades_df["net_pnl"] <= 0]
@@ -648,7 +709,7 @@ def build_trade_summary(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> dic
     expectancy = (win_rate * avg_win) - (loss_rate * abs(avg_loss))
     avg_rr = (avg_win / abs(avg_loss)) if avg_loss < 0 else np.nan
 
-    return {
+    base = {
         "strategy_return_%": round(strategy_return_pct, 2),
         "buy_hold_%": round(buy_hold_return_pct, 2),
         "max_drawdown_%": round(max_drawdown_pct, 2),
@@ -660,10 +721,12 @@ def build_trade_summary(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> dic
         "profit_factor": round(float(profit_factor), 2) if np.isfinite(profit_factor) else 10.0,
         "expectancy_$": round(float(expectancy), 2),
     }
+    base.update(monte_carlo_trade_bootstrap(trades_df))
+    return base
 
 
 # =========================================================
-# RUN PER TICKER
+# PER TICKER
 # =========================================================
 
 def run_for_ticker(
@@ -671,22 +734,10 @@ def run_for_ticker(
     params: StrategyParams,
     feature_store: Dict[str, pd.DataFrame],
 ) -> Tuple[dict, pd.DataFrame, pd.DataFrame]:
-    df = build_dataset_for_params(
-        ticker=ticker,
-        params=params,
-        feature_store=feature_store,
-    )
-
-    equity_df, trades_df = run_backtest(
-        df=df,
-        stop_atr_mult=params.stop_atr_mult,
-        tp_mults=(params.tp1_mult, params.tp2_mult, params.tp3_mult),
-        min_atr_pct=params.min_atr_pct,
-    )
-
+    df = build_dataset_for_params(ticker=ticker, params=params, feature_store=feature_store)
+    equity_df, trades_df = run_backtest(df=df, params=params)
     summary = build_trade_summary(trades_df, equity_df)
     summary["ticker"] = ticker
-
     return summary, equity_df, trades_df
 
 
@@ -695,7 +746,7 @@ def run_for_ticker(
 # =========================================================
 
 def build_param_grid() -> List[StrategyParams]:
-    params: List[StrategyParams] = []
+    out: List[StrategyParams] = []
 
     for (
         fast_window,
@@ -707,6 +758,8 @@ def build_param_grid() -> List[StrategyParams]:
         tp3_mult,
         regime_ma_window,
         min_atr_pct,
+        sweep_lookback,
+        require_sweep,
     ) in product(
         FAST_WINDOWS,
         SLOW_WINDOWS,
@@ -717,13 +770,15 @@ def build_param_grid() -> List[StrategyParams]:
         TP3_MULTS,
         REGIME_MA_WINDOWS,
         MIN_ATR_PCTS,
+        SWEEP_LOOKBACKS,
+        REQUIRE_SWEEP_OPTIONS,
     ):
         if fast_window >= slow_window:
             continue
         if not (tp1_mult < tp2_mult < tp3_mult):
             continue
 
-        params.append(
+        out.append(
             StrategyParams(
                 fast_window=fast_window,
                 slow_window=slow_window,
@@ -734,10 +789,12 @@ def build_param_grid() -> List[StrategyParams]:
                 tp3_mult=tp3_mult,
                 regime_ma_window=regime_ma_window,
                 min_atr_pct=min_atr_pct,
+                sweep_lookback=sweep_lookback,
+                require_sweep=require_sweep,
             )
         )
 
-    return params
+    return out
 
 
 def optimize(feature_store: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -751,11 +808,7 @@ def optimize(feature_store: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 
         for ticker in TICKERS:
             try:
-                summary, _, _ = run_for_ticker(
-                    ticker=ticker,
-                    params=params,
-                    feature_store=feature_store,
-                )
+                summary, _, _ = run_for_ticker(ticker=ticker, params=params, feature_store=feature_store)
                 ticker_summaries.append(summary)
 
                 if summary["num_trades"] >= MIN_TRADES_PER_TICKER:
@@ -779,6 +832,8 @@ def optimize(feature_store: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             "tp3_mult": params.tp3_mult,
             "regime_ma_window": params.regime_ma_window,
             "min_atr_pct": params.min_atr_pct,
+            "sweep_lookback": params.sweep_lookback,
+            "require_sweep": params.require_sweep,
             "avg_strategy_return_%": df_sum["strategy_return_%"].mean(),
             "avg_buy_hold_%": df_sum["buy_hold_%"].mean(),
             "avg_max_drawdown_%": df_sum["max_drawdown_%"].mean(),
@@ -789,17 +844,39 @@ def optimize(feature_store: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             "avg_avg_rr": df_sum["avg_rr"].mean(skipna=True),
             "avg_profit_factor": df_sum["profit_factor"].mean(),
             "avg_expectancy_$": df_sum["expectancy_$"].mean(),
+            "avg_mc_prob_profit_%": df_sum["mc_prob_profit_%"].mean(),
+            "avg_mc_p05_return_%": df_sum["mc_p05_return_%"].mean(),
+            "avg_mc_median_max_dd_%": df_sum["mc_median_max_dd_%"].mean(),
             "valid_ticker_count": valid_ticker_count,
         }
 
+        # hard filters נגד overfit
+        if row["valid_ticker_count"] < MIN_VALID_TICKERS:
+            continue
+
+        if row["avg_num_trades"] < MIN_TRADES_PER_TICKER:
+            continue
+
+        if pd.notna(row["avg_avg_rr"]) and row["avg_avg_rr"] < MIN_AVG_RR:
+            continue
+
         row["score"] = (
-            row["avg_strategy_return_%"] * 0.25
-            + row["avg_profit_factor"] * 20.0
+            row["avg_strategy_return_%"] * 0.20
+            + row["avg_profit_factor"] * 18.0
             + row["avg_expectancy_$"] * 0.10
             + row["avg_win_rate_%"] * 0.20
-            + row["avg_max_drawdown_%"] * 0.15
-            + row["valid_ticker_count"] * 5.0
+            + row["avg_max_drawdown_%"] * 0.20
+            + row["valid_ticker_count"] * 8.0
+            + row["avg_mc_prob_profit_%"] * 0.10
+            + row["avg_mc_p05_return_%"] * 0.10
+            + row["avg_mc_median_max_dd_%"] * 0.10
         )
+
+        # drawdown penalties
+        if row["avg_max_drawdown_%"] < -30:
+            row["score"] -= 40
+        if row["avg_max_drawdown_%"] < -40:
+            row["score"] -= 80
 
         results.append(row)
 
@@ -807,7 +884,7 @@ def optimize(feature_store: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             print(f"tested {idx}/{total} parameter sets")
 
     if not results:
-        raise ValueError("No optimization results produced.")
+        raise ValueError("No optimization results produced after filters.")
 
     results_df = pd.DataFrame(results)
     results_df = results_df.sort_values(by="score", ascending=False).reset_index(drop=True)
@@ -815,7 +892,7 @@ def optimize(feature_store: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 # =========================================================
-# FINAL RUN ON BEST CONFIG
+# FINAL RUN
 # =========================================================
 
 def run_best_configuration(best_row: pd.Series, feature_store: Dict[str, pd.DataFrame]) -> None:
@@ -829,17 +906,15 @@ def run_best_configuration(best_row: pd.Series, feature_store: Dict[str, pd.Data
         tp3_mult=float(best_row["tp3_mult"]),
         regime_ma_window=int(best_row["regime_ma_window"]),
         min_atr_pct=float(best_row["min_atr_pct"]),
+        sweep_lookback=int(best_row["sweep_lookback"]),
+        require_sweep=bool(best_row["require_sweep"]),
     )
 
     all_results = []
 
     for ticker in TICKERS:
         try:
-            summary, equity_df, trades_df = run_for_ticker(
-                ticker=ticker,
-                params=params,
-                feature_store=feature_store,
-            )
+            summary, equity_df, trades_df = run_for_ticker(ticker=ticker, params=params, feature_store=feature_store)
             all_results.append(summary)
 
             trades_path = OUTPUT_DIR / f"{ticker}_optimized_trades.csv"
@@ -870,6 +945,9 @@ def run_best_configuration(best_row: pd.Series, feature_store: Dict[str, pd.Data
             "avg_rr",
             "profit_factor",
             "expectancy_$",
+            "mc_prob_profit_%",
+            "mc_p05_return_%",
+            "mc_median_max_dd_%",
         ]
 
         agg = results_df[numeric_cols].mean(numeric_only=True).to_frame().T
@@ -896,9 +974,9 @@ def main() -> None:
     print("\n===== TOP 15 PARAMETER COMBINATIONS =====")
     print(results_df.head(TOP_N_RESULTS).to_string(index=False))
 
-    optimization_path = OUTPUT_DIR / "optimizer_results.csv"
-    results_df.to_csv(optimization_path, index=False)
-    print(f"\nSaved optimizer results to: {optimization_path}")
+    optimizer_path = OUTPUT_DIR / "optimizer_results.csv"
+    results_df.to_csv(optimizer_path, index=False)
+    print(f"\nSaved optimizer results to: {optimizer_path}")
 
     best_row = results_df.iloc[0]
     print("\n===== BEST CONFIGURATION =====")

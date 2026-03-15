@@ -1,10 +1,24 @@
+from __future__ import annotations
+
 from pathlib import Path
 from itertools import product
 import math
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
 import numpy as np
 import pandas as pd
 
+warnings.simplefilter("ignore", FutureWarning)
+
+# =========================================================
+# CONFIG
+# =========================================================
+
 RAW_DIR = Path("data/raw")
+OUTPUT_DIR = Path("data/quant_results")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TICKERS = ["AAPL", "MSFT", "NVDA", "SPY", "QQQ"]
 REGIME_TICKER = "SPY"
@@ -19,7 +33,6 @@ LONG_SLOW_LEVEL = 50
 SHORT_FAST_LEVEL = 70
 SHORT_SLOW_LEVEL = 50
 
-# ===== Parameter Grid =====
 FAST_WINDOWS = [14, 21, 30, 42]
 SLOW_WINDOWS = [42, 55, 84]
 ATR_WINDOWS = [14]
@@ -28,10 +41,32 @@ TP1_MULTS = [1.0, 1.5]
 TP2_MULTS = [2.0, 2.5]
 TP3_MULTS = [3.0, 4.0]
 REGIME_MA_WINDOWS = [100, 150, 200]
-MIN_ATR_PCTS = [0.015, 0.02, 0.025]  # ATR / Close threshold
+MIN_ATR_PCTS = [0.015, 0.02, 0.025]
 
 MIN_TRADES_PER_TICKER = 5
+TOP_N_RESULTS = 15
 
+
+# =========================================================
+# DATA STRUCTURES
+# =========================================================
+
+@dataclass(frozen=True)
+class StrategyParams:
+    fast_window: int
+    slow_window: int
+    atr_window: int
+    stop_atr_mult: float
+    tp1_mult: float
+    tp2_mult: float
+    tp3_mult: float
+    regime_ma_window: int
+    min_atr_pct: float
+
+
+# =========================================================
+# UTILS
+# =========================================================
 
 def validate_ohlcv(df: pd.DataFrame) -> None:
     required_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
@@ -40,33 +75,6 @@ def validate_ohlcv(df: pd.DataFrame) -> None:
         raise ValueError(f"Missing required columns: {missing}")
     if df.empty:
         raise ValueError("Input DataFrame is empty")
-
-
-def load_raw_ticker_data(ticker: str) -> pd.DataFrame:
-    file_path = RAW_DIR / f"{ticker}.parquet"
-    if not file_path.exists():
-        raise FileNotFoundError(f"Raw data file not found: {file_path}")
-
-    df = pd.read_parquet(file_path)
-    validate_ohlcv(df)
-    return df.sort_values("Date").reset_index(drop=True).copy()
-
-
-def williams_r_normalized(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
-    highest_high = high.rolling(window).max()
-    lowest_low = low.rolling(window).min()
-    denom = (highest_high - lowest_low).replace(0, np.nan)
-    willr_raw = -100 * ((highest_high - close) / denom)
-    return 100 + willr_raw
-
-
-def compute_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    prev_close = df["Close"].shift(1)
-    tr1 = df["High"] - df["Low"]
-    tr2 = (df["High"] - prev_close).abs()
-    tr3 = (df["Low"] - prev_close).abs()
-    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return true_range.rolling(window).mean()
 
 
 def crossed_above(prev_value: float, current_value: float, level: float) -> bool:
@@ -83,6 +91,12 @@ def split_shares_into_tranches(total_shares: int) -> list[int]:
     return [base + (1 if i < remainder else 0) for i in range(3)]
 
 
+def calc_leg_pnl(side: str, entry_price: float, exit_price: float, qty: int) -> float:
+    if side == "long":
+        return qty * (exit_price - entry_price)
+    return qty * (entry_price - exit_price)
+
+
 def compute_position_size(equity: float, entry_price: float, stop_price: float) -> int:
     risk_dollars = equity * RISK_PER_TRADE_PCT
     stop_distance = abs(entry_price - stop_price)
@@ -92,41 +106,166 @@ def compute_position_size(equity: float, entry_price: float, stop_price: float) 
 
     raw_shares = math.floor(risk_dollars / stop_distance)
     max_affordable = math.floor(equity / entry_price) if entry_price > 0 else 0
+
     return max(0, min(raw_shares, max_affordable))
 
 
-def compute_features(
-    df: pd.DataFrame,
-    fast_window: int,
-    slow_window: int,
-    atr_window: int,
-) -> pd.DataFrame:
-    df = df.sort_values("Date").copy()
+# =========================================================
+# INDICATORS
+# =========================================================
 
-    df["willi_fast"] = williams_r_normalized(df["High"], df["Low"], df["Close"], fast_window)
-    df["willi_slow"] = williams_r_normalized(df["High"], df["Low"], df["Close"], slow_window)
-    df["atr"] = compute_atr(df, atr_window)
-    df["atr_pct"] = df["atr"] / df["Close"]
-    df["returns"] = df["Close"].pct_change().fillna(0)
+def williams_r_normalized(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    window: int,
+) -> pd.Series:
+    highest_high = high.rolling(window).max()
+    lowest_low = low.rolling(window).min()
+    denom = (highest_high - lowest_low).replace(0, np.nan)
+    willr_raw = -100 * ((highest_high - close) / denom)
+    return 100 + willr_raw
 
-    df = df.dropna(subset=["willi_fast", "willi_slow", "atr", "atr_pct"]).reset_index(drop=True)
+
+def compute_atr(df: pd.DataFrame, window: int) -> pd.Series:
+    prev_close = df["Close"].shift(1)
+    tr1 = df["High"] - df["Low"]
+    tr2 = (df["High"] - prev_close).abs()
+    tr3 = (df["Low"] - prev_close).abs()
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return true_range.rolling(window).mean()
+
+
+def compute_regime_ma(close: pd.Series, window: int) -> pd.Series:
+    return close.rolling(window).mean()
+
+
+# =========================================================
+# LOADING + FEATURE STORE
+# =========================================================
+
+def load_raw_ticker_data(ticker: str) -> pd.DataFrame:
+    file_path = RAW_DIR / f"{ticker}.parquet"
+    if not file_path.exists():
+        raise FileNotFoundError(f"Raw data file not found: {file_path}")
+
+    df = pd.read_parquet(file_path)
+    validate_ohlcv(df)
+
+    df = df.sort_values("Date").reset_index(drop=True).copy()
+    df["Date"] = pd.to_datetime(df["Date"])
     return df
 
 
-def compute_regime_df(spy_df: pd.DataFrame, regime_ma_window: int) -> pd.DataFrame:
-    out = spy_df[["Date", "Close"]].copy()
-    out["regime_ma"] = out["Close"].rolling(regime_ma_window).mean()
-    out["bull_regime"] = out["Close"] > out["regime_ma"]
-    out = out.dropna(subset=["regime_ma"]).reset_index(drop=True)
-    return out[["Date", "bull_regime"]]
+def load_all_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    for ticker in tickers:
+        out[ticker] = load_raw_ticker_data(ticker)
+    return out
 
 
-def merge_regime(asset_df: pd.DataFrame, regime_df: pd.DataFrame) -> pd.DataFrame:
-    merged = asset_df.merge(regime_df, on="Date", how="left")
-    merged["bull_regime"] = merged["bull_regime"].where(merged["bull_regime"].notna(), False)
-    merged["bull_regime"] = merged["bull_regime"].astype(bool)
+def build_feature_store(
+    market_data: Dict[str, pd.DataFrame],
+) -> Dict[str, pd.DataFrame]:
+    """
+    מחשב מראש את כל הפיצ'רים האפשריים שנצטרך,
+    כדי לא לחשב אותם מחדש בכל קומבינציה.
+    """
+    all_williams_windows = sorted(set(FAST_WINDOWS + SLOW_WINDOWS))
+    all_atr_windows = sorted(set(ATR_WINDOWS))
+    all_regime_windows = sorted(set(REGIME_MA_WINDOWS))
+
+    feature_store: Dict[str, pd.DataFrame] = {}
+
+    for ticker, df in market_data.items():
+        feat = df.copy()
+
+        # returns
+        feat["returns"] = feat["Close"].pct_change().fillna(0)
+
+        # Williams
+        for w in all_williams_windows:
+            feat[f"willi_{w}"] = williams_r_normalized(
+                feat["High"], feat["Low"], feat["Close"], w
+            )
+
+        # ATR + ATR%
+        for w in all_atr_windows:
+            atr = compute_atr(feat, w)
+            feat[f"atr_{w}"] = atr
+            feat[f"atr_pct_{w}"] = atr / feat["Close"]
+
+        # regime MA for SPY reference only
+        if ticker == REGIME_TICKER:
+            for w in all_regime_windows:
+                feat[f"regime_ma_{w}"] = compute_regime_ma(feat["Close"], w)
+                feat[f"bull_regime_{w}"] = feat["Close"] > feat[f"regime_ma_{w}"]
+
+        feature_store[ticker] = feat
+
+    return feature_store
+
+
+def merge_regime(asset_df: pd.DataFrame, regime_df: pd.DataFrame, regime_col: str) -> pd.DataFrame:
+    merged = asset_df.merge(
+        regime_df[["Date", regime_col]],
+        on="Date",
+        how="left",
+    )
+    merged[regime_col] = merged[regime_col].where(merged[regime_col].notna(), False)
+    merged[regime_col] = merged[regime_col].astype(bool)
     return merged
 
+
+def build_dataset_for_params(
+    ticker: str,
+    params: StrategyParams,
+    feature_store: Dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    asset_df = feature_store[ticker].copy()
+    regime_df = feature_store[REGIME_TICKER].copy()
+
+    fast_col = f"willi_{params.fast_window}"
+    slow_col = f"willi_{params.slow_window}"
+    atr_col = f"atr_{params.atr_window}"
+    atr_pct_col = f"atr_pct_{params.atr_window}"
+    regime_col = f"bull_regime_{params.regime_ma_window}"
+
+    if fast_col not in asset_df.columns:
+        raise ValueError(f"Missing column {fast_col} for {ticker}")
+    if slow_col not in asset_df.columns:
+        raise ValueError(f"Missing column {slow_col} for {ticker}")
+    if atr_col not in asset_df.columns:
+        raise ValueError(f"Missing column {atr_col} for {ticker}")
+    if atr_pct_col not in asset_df.columns:
+        raise ValueError(f"Missing column {atr_pct_col} for {ticker}")
+    if regime_col not in regime_df.columns:
+        raise ValueError(f"Missing regime column {regime_col} for {REGIME_TICKER}")
+
+    asset_df = asset_df.rename(
+        columns={
+            fast_col: "willi_fast",
+            slow_col: "willi_slow",
+            atr_col: "atr",
+            atr_pct_col: "atr_pct",
+        }
+    )
+
+    merged = merge_regime(asset_df, regime_df, regime_col=regime_col)
+    merged = merged.rename(columns={regime_col: "bull_regime"})
+
+    needed = [
+        "Date", "Open", "High", "Low", "Close", "Volume",
+        "returns", "willi_fast", "willi_slow", "atr", "atr_pct", "bull_regime",
+    ]
+    merged = merged[needed].dropna().reset_index(drop=True)
+
+    return merged
+
+
+# =========================================================
+# SIGNALS
+# =========================================================
 
 def is_long_signal(prev_row: pd.Series, signal_row: pd.Series) -> bool:
     return (
@@ -142,6 +281,10 @@ def is_short_signal(prev_row: pd.Series, signal_row: pd.Series) -> bool:
     )
 
 
+# =========================================================
+# TRADE OBJECT HELPERS
+# =========================================================
+
 def create_trade(
     side: str,
     signal_bar_date,
@@ -150,7 +293,7 @@ def create_trade(
     atr: float,
     shares_total: int,
     stop_atr_mult: float,
-    tp_mults: tuple[float, float, float],
+    tp_mults: Tuple[float, float, float],
 ) -> dict:
     tp1_mult, tp2_mult, tp3_mult = tp_mults
 
@@ -170,21 +313,23 @@ def create_trade(
         ]
 
     tranche_sizes = split_shares_into_tranches(shares_total)
-
     tranches = []
+
     for idx, qty in enumerate(tranche_sizes):
-        tranches.append({
-            "tranche_id": idx + 1,
-            "qty": qty,
-            "tp_price": tp_prices[idx],
-            "is_open": qty > 0,
-            "exit_price": None,
-            "exit_date": None,
-            "exit_reason": None,
-            "gross_pnl": 0.0,
-            "fees": 0.0,
-            "net_pnl": 0.0,
-        })
+        tranches.append(
+            {
+                "tranche_id": idx + 1,
+                "qty": qty,
+                "tp_price": tp_prices[idx],
+                "is_open": qty > 0,
+                "exit_price": None,
+                "exit_date": None,
+                "exit_reason": None,
+                "gross_pnl": 0.0,
+                "fees": 0.0,
+                "net_pnl": 0.0,
+            }
+        )
 
     entry_fee = shares_total * entry_price * ENTRY_FEE_PCT
 
@@ -206,13 +351,13 @@ def create_trade(
     }
 
 
-def calc_leg_pnl(side: str, entry_price: float, exit_price: float, qty: int) -> float:
-    if side == "long":
-        return qty * (exit_price - entry_price)
-    return qty * (entry_price - exit_price)
-
-
-def close_tranche(trade: dict, tranche_idx: int, exit_price: float, exit_date, exit_reason: str) -> None:
+def close_tranche(
+    trade: dict,
+    tranche_idx: int,
+    exit_price: float,
+    exit_date,
+    exit_reason: str,
+) -> None:
     tranche = trade["tranches"][tranche_idx]
     if not tranche["is_open"] or tranche["qty"] == 0:
         return
@@ -270,7 +415,7 @@ def compute_trade_totals(trade: dict) -> dict:
     }
 
 
-def mark_to_market_value(trade: dict | None, close_price: float) -> float:
+def mark_to_market_value(trade: Optional[dict], close_price: float) -> float:
     if trade is None:
         return 0.0
 
@@ -300,7 +445,7 @@ def handle_open_trade_for_bar(trade: dict, row: pd.Series) -> None:
     else:
         stop_hit = current_high >= trade["current_stop"]
 
-    # conservative intrabar rule: stop first
+    # conservative daily rule: stop first
     if stop_hit:
         for idx in open_indices:
             close_tranche(trade, idx, trade["current_stop"], current_date, "stop")
@@ -308,6 +453,7 @@ def handle_open_trade_for_bar(trade: dict, row: pd.Series) -> None:
         trade["exit_reason"] = "stop"
         return
 
+    # then targets
     for idx in open_indices:
         tranche = trade["tranches"][idx]
         tp_price = tranche["tp_price"]
@@ -324,12 +470,16 @@ def handle_open_trade_for_bar(trade: dict, row: pd.Series) -> None:
         trade["exit_reason"] = "tp_complete"
 
 
+# =========================================================
+# BACKTEST
+# =========================================================
+
 def run_backtest(
     df: pd.DataFrame,
     stop_atr_mult: float,
-    tp_mults: tuple[float, float, float],
+    tp_mults: Tuple[float, float, float],
     min_atr_pct: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = df.sort_values("Date").reset_index(drop=True).copy()
 
     cash = INITIAL_CAPITAL
@@ -355,7 +505,6 @@ def run_backtest(
             volatility_ok = signal_row["atr_pct"] >= min_atr_pct
             bull_regime = bool(signal_row["bull_regime"])
 
-            # לונגים רק בשוק שורי, שורטים רק כשלא שורי
             allow_long = bull_regime and volatility_ok
             allow_short = (not bull_regime) and volatility_ok
 
@@ -369,7 +518,6 @@ def run_backtest(
             if side is not None:
                 entry_price = float(row["Open"])
                 atr = float(signal_row["atr"])
-
                 stop_price = entry_price - stop_atr_mult * atr if side == "long" else entry_price + stop_atr_mult * atr
                 shares_total = compute_position_size(cash, entry_price, stop_price)
 
@@ -408,40 +556,44 @@ def run_backtest(
                 else:
                     cash += open_trade["shares_total"] * open_trade["entry_price"] + totals["net_pnl"]
 
-                closed_trades.append({
-                    "side": open_trade["side"],
-                    "signal_bar_date": open_trade["signal_bar_date"],
-                    "entry_date": open_trade["entry_date"],
-                    "exit_date": totals["last_exit_date"],
-                    "entry_price": round(open_trade["entry_price"], 4),
-                    "initial_stop": round(open_trade["initial_stop"], 4),
-                    "final_stop": round(open_trade["current_stop"], 4),
-                    "tp1_price": round(open_trade["tp1_price"], 4),
-                    "tp2_price": round(open_trade["tp2_price"], 4),
-                    "tp3_price": round(open_trade["tp3_price"], 4),
-                    "shares_total": open_trade["shares_total"],
-                    "tp_hits": totals["tp_hits"],
-                    "exit_reason": open_trade["exit_reason"],
-                    "gross_pnl": round(totals["gross_pnl"], 4),
-                    "total_fees": round(totals["total_fees"], 4),
-                    "net_pnl": round(totals["net_pnl"], 4),
-                    "holding_days": (
-                        pd.Timestamp(totals["last_exit_date"]) - pd.Timestamp(open_trade["entry_date"])
-                    ).days if totals["last_exit_date"] is not None else 0,
-                })
+                closed_trades.append(
+                    {
+                        "side": open_trade["side"],
+                        "signal_bar_date": open_trade["signal_bar_date"],
+                        "entry_date": open_trade["entry_date"],
+                        "exit_date": totals["last_exit_date"],
+                        "entry_price": round(open_trade["entry_price"], 4),
+                        "initial_stop": round(open_trade["initial_stop"], 4),
+                        "final_stop": round(open_trade["current_stop"], 4),
+                        "tp1_price": round(open_trade["tp1_price"], 4),
+                        "tp2_price": round(open_trade["tp2_price"], 4),
+                        "tp3_price": round(open_trade["tp3_price"], 4),
+                        "shares_total": open_trade["shares_total"],
+                        "tp_hits": totals["tp_hits"],
+                        "exit_reason": open_trade["exit_reason"],
+                        "gross_pnl": round(totals["gross_pnl"], 4),
+                        "total_fees": round(totals["total_fees"], 4),
+                        "net_pnl": round(totals["net_pnl"], 4),
+                        "holding_days": (
+                            pd.Timestamp(totals["last_exit_date"]) - pd.Timestamp(open_trade["entry_date"])
+                        ).days if totals["last_exit_date"] is not None else 0,
+                    }
+                )
 
                 open_trade = None
 
         open_value = mark_to_market_value(open_trade, float(row["Close"]))
         equity = cash + open_value
 
-        equity_rows.append({
-            "Date": current_date,
-            "cash": cash,
-            "open_value": open_value,
-            "equity_curve": equity,
-            "buy_and_hold_value": buy_and_hold_value,
-        })
+        equity_rows.append(
+            {
+                "Date": current_date,
+                "cash": cash,
+                "open_value": open_value,
+                "equity_curve": equity,
+                "buy_and_hold_value": buy_and_hold_value,
+            }
+        )
 
     equity_df = pd.DataFrame(equity_rows)
     equity_df["rolling_max"] = equity_df["equity_curve"].cummax()
@@ -450,6 +602,10 @@ def run_backtest(
     trades_df = pd.DataFrame(closed_trades)
     return equity_df, trades_df
 
+
+# =========================================================
+# SUMMARY / SCORING
+# =========================================================
 
 def build_trade_summary(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> dict:
     strategy_return_pct = (float(equity_df["equity_curve"].iloc[-1]) / INITIAL_CAPITAL - 1) * 100
@@ -506,51 +662,40 @@ def build_trade_summary(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> dic
     }
 
 
-def score_result(summary: dict) -> float:
-    return (
-        summary["strategy_return_%"] * 0.25
-        + summary["profit_factor"] * 20.0
-        + summary["expectancy_$"] * 0.10
-        + summary["win_rate_%"] * 0.20
-        + summary["max_drawdown_%"] * 0.15
-    )
-
+# =========================================================
+# RUN PER TICKER
+# =========================================================
 
 def run_for_ticker(
     ticker: str,
-    spy_regime_df: pd.DataFrame,
-    fast_window: int,
-    slow_window: int,
-    atr_window: int,
-    stop_atr_mult: float,
-    tp_mults: tuple[float, float, float],
-    min_atr_pct: float,
-) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
-    raw_df = load_raw_ticker_data(ticker)
-    feat_df = compute_features(raw_df, fast_window=fast_window, slow_window=slow_window, atr_window=atr_window)
-    feat_df = merge_regime(feat_df, spy_regime_df)
-    equity_df, trades_df = run_backtest(feat_df, stop_atr_mult=stop_atr_mult, tp_mults=tp_mults, min_atr_pct=min_atr_pct)
+    params: StrategyParams,
+    feature_store: Dict[str, pd.DataFrame],
+) -> Tuple[dict, pd.DataFrame, pd.DataFrame]:
+    df = build_dataset_for_params(
+        ticker=ticker,
+        params=params,
+        feature_store=feature_store,
+    )
+
+    equity_df, trades_df = run_backtest(
+        df=df,
+        stop_atr_mult=params.stop_atr_mult,
+        tp_mults=(params.tp1_mult, params.tp2_mult, params.tp3_mult),
+        min_atr_pct=params.min_atr_pct,
+    )
+
     summary = build_trade_summary(trades_df, equity_df)
     summary["ticker"] = ticker
+
     return summary, equity_df, trades_df
 
 
-def optimize() -> pd.DataFrame:
-    spy_raw = load_raw_ticker_data(REGIME_TICKER)
+# =========================================================
+# OPTIMIZER
+# =========================================================
 
-    results = []
-
-    param_grid = product(
-        FAST_WINDOWS,
-        SLOW_WINDOWS,
-        ATR_WINDOWS,
-        STOP_ATR_MULTS,
-        TP1_MULTS,
-        TP2_MULTS,
-        TP3_MULTS,
-        REGIME_MA_WINDOWS,
-        MIN_ATR_PCTS,
-    )
+def build_param_grid() -> List[StrategyParams]:
+    params: List[StrategyParams] = []
 
     for (
         fast_window,
@@ -562,58 +707,78 @@ def optimize() -> pd.DataFrame:
         tp3_mult,
         regime_ma_window,
         min_atr_pct,
-    ) in param_grid:
+    ) in product(
+        FAST_WINDOWS,
+        SLOW_WINDOWS,
+        ATR_WINDOWS,
+        STOP_ATR_MULTS,
+        TP1_MULTS,
+        TP2_MULTS,
+        TP3_MULTS,
+        REGIME_MA_WINDOWS,
+        MIN_ATR_PCTS,
+    ):
         if fast_window >= slow_window:
             continue
         if not (tp1_mult < tp2_mult < tp3_mult):
             continue
 
-        tp_mults = (tp1_mult, tp2_mult, tp3_mult)
-        spy_regime_df = compute_regime_df(spy_raw, regime_ma_window)
+        params.append(
+            StrategyParams(
+                fast_window=fast_window,
+                slow_window=slow_window,
+                atr_window=atr_window,
+                stop_atr_mult=stop_atr_mult,
+                tp1_mult=tp1_mult,
+                tp2_mult=tp2_mult,
+                tp3_mult=tp3_mult,
+                regime_ma_window=regime_ma_window,
+                min_atr_pct=min_atr_pct,
+            )
+        )
 
+    return params
+
+
+def optimize(feature_store: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    param_grid = build_param_grid()
+    total = len(param_grid)
+    results = []
+
+    for idx, params in enumerate(param_grid, start=1):
         ticker_summaries = []
-        total_valid = 0
+        valid_ticker_count = 0
 
         for ticker in TICKERS:
             try:
                 summary, _, _ = run_for_ticker(
                     ticker=ticker,
-                    spy_regime_df=spy_regime_df,
-                    fast_window=fast_window,
-                    slow_window=slow_window,
-                    atr_window=atr_window,
-                    stop_atr_mult=stop_atr_mult,
-                    tp_mults=tp_mults,
-                    min_atr_pct=min_atr_pct,
+                    params=params,
+                    feature_store=feature_store,
                 )
-
-                if summary["num_trades"] >= MIN_TRADES_PER_TICKER:
-                    total_valid += 1
-
                 ticker_summaries.append(summary)
 
+                if summary["num_trades"] >= MIN_TRADES_PER_TICKER:
+                    valid_ticker_count += 1
+
             except Exception as e:
-                print(
-                    f"Failed params for {ticker}: "
-                    f"fast={fast_window}, slow={slow_window}, stop={stop_atr_mult}, "
-                    f"tp={tp_mults}, regime_ma={regime_ma_window}, min_atr_pct={min_atr_pct} -> {e}"
-                )
+                print(f"Failed {ticker} with params={params}: {e}")
 
         if not ticker_summaries:
             continue
 
         df_sum = pd.DataFrame(ticker_summaries)
 
-        avg_summary = {
-            "fast_window": fast_window,
-            "slow_window": slow_window,
-            "atr_window": atr_window,
-            "stop_atr_mult": stop_atr_mult,
-            "tp1_mult": tp1_mult,
-            "tp2_mult": tp2_mult,
-            "tp3_mult": tp3_mult,
-            "regime_ma_window": regime_ma_window,
-            "min_atr_pct": min_atr_pct,
+        row = {
+            "fast_window": params.fast_window,
+            "slow_window": params.slow_window,
+            "atr_window": params.atr_window,
+            "stop_atr_mult": params.stop_atr_mult,
+            "tp1_mult": params.tp1_mult,
+            "tp2_mult": params.tp2_mult,
+            "tp3_mult": params.tp3_mult,
+            "regime_ma_window": params.regime_ma_window,
+            "min_atr_pct": params.min_atr_pct,
             "avg_strategy_return_%": df_sum["strategy_return_%"].mean(),
             "avg_buy_hold_%": df_sum["buy_hold_%"].mean(),
             "avg_max_drawdown_%": df_sum["max_drawdown_%"].mean(),
@@ -624,19 +789,22 @@ def optimize() -> pd.DataFrame:
             "avg_avg_rr": df_sum["avg_rr"].mean(skipna=True),
             "avg_profit_factor": df_sum["profit_factor"].mean(),
             "avg_expectancy_$": df_sum["expectancy_$"].mean(),
-            "valid_ticker_count": total_valid,
+            "valid_ticker_count": valid_ticker_count,
         }
 
-        avg_summary["score"] = (
-            avg_summary["avg_strategy_return_%"] * 0.25
-            + avg_summary["avg_profit_factor"] * 20.0
-            + avg_summary["avg_expectancy_$"] * 0.10
-            + avg_summary["avg_win_rate_%"] * 0.20
-            + avg_summary["avg_max_drawdown_%"] * 0.15
-            + avg_summary["valid_ticker_count"] * 5.0
+        row["score"] = (
+            row["avg_strategy_return_%"] * 0.25
+            + row["avg_profit_factor"] * 20.0
+            + row["avg_expectancy_$"] * 0.10
+            + row["avg_win_rate_%"] * 0.20
+            + row["avg_max_drawdown_%"] * 0.15
+            + row["valid_ticker_count"] * 5.0
         )
 
-        results.append(avg_summary)
+        results.append(row)
+
+        if idx % 50 == 0 or idx == total:
+            print(f"tested {idx}/{total} parameter sets")
 
     if not results:
         raise ValueError("No optimization results produced.")
@@ -646,14 +814,21 @@ def optimize() -> pd.DataFrame:
     return results_df
 
 
-def run_best_configuration(best_row: pd.Series) -> None:
-    spy_raw = load_raw_ticker_data(REGIME_TICKER)
-    spy_regime_df = compute_regime_df(spy_raw, int(best_row["regime_ma_window"]))
+# =========================================================
+# FINAL RUN ON BEST CONFIG
+# =========================================================
 
-    tp_mults = (
-        float(best_row["tp1_mult"]),
-        float(best_row["tp2_mult"]),
-        float(best_row["tp3_mult"]),
+def run_best_configuration(best_row: pd.Series, feature_store: Dict[str, pd.DataFrame]) -> None:
+    params = StrategyParams(
+        fast_window=int(best_row["fast_window"]),
+        slow_window=int(best_row["slow_window"]),
+        atr_window=int(best_row["atr_window"]),
+        stop_atr_mult=float(best_row["stop_atr_mult"]),
+        tp1_mult=float(best_row["tp1_mult"]),
+        tp2_mult=float(best_row["tp2_mult"]),
+        tp3_mult=float(best_row["tp3_mult"]),
+        regime_ma_window=int(best_row["regime_ma_window"]),
+        min_atr_pct=float(best_row["min_atr_pct"]),
     )
 
     all_results = []
@@ -662,18 +837,13 @@ def run_best_configuration(best_row: pd.Series) -> None:
         try:
             summary, equity_df, trades_df = run_for_ticker(
                 ticker=ticker,
-                spy_regime_df=spy_regime_df,
-                fast_window=int(best_row["fast_window"]),
-                slow_window=int(best_row["slow_window"]),
-                atr_window=int(best_row["atr_window"]),
-                stop_atr_mult=float(best_row["stop_atr_mult"]),
-                tp_mults=tp_mults,
-                min_atr_pct=float(best_row["min_atr_pct"]),
+                params=params,
+                feature_store=feature_store,
             )
             all_results.append(summary)
 
-            trades_path = Path("data") / f"{ticker}_optimized_trades.csv"
-            equity_path = Path("data") / f"{ticker}_optimized_equity.csv"
+            trades_path = OUTPUT_DIR / f"{ticker}_optimized_trades.csv"
+            equity_path = OUTPUT_DIR / f"{ticker}_optimized_equity.csv"
 
             trades_df.to_csv(trades_path, index=False)
             equity_df.to_csv(equity_path, index=False)
@@ -686,7 +856,7 @@ def run_best_configuration(best_row: pd.Series) -> None:
         print("\n===== FINAL SUMMARY (BEST CONFIG) =====")
         print(results_df.to_string(index=False))
 
-        summary_path = Path("data") / "optimized_strategy_summary.csv"
+        summary_path = OUTPUT_DIR / "optimized_strategy_summary.csv"
         results_df.to_csv(summary_path, index=False)
 
         numeric_cols = [
@@ -709,13 +879,24 @@ def run_best_configuration(best_row: pd.Series) -> None:
         print(f"\nSaved final per-ticker summary to: {summary_path}")
 
 
+# =========================================================
+# MAIN
+# =========================================================
+
 def main() -> None:
-    results_df = optimize()
+    print("Loading market data...")
+    market_data = load_all_data(sorted(set(TICKERS + [REGIME_TICKER])))
+
+    print("Building feature store...")
+    feature_store = build_feature_store(market_data)
+
+    print("Running optimizer...")
+    results_df = optimize(feature_store)
 
     print("\n===== TOP 15 PARAMETER COMBINATIONS =====")
-    print(results_df.head(15).to_string(index=False))
+    print(results_df.head(TOP_N_RESULTS).to_string(index=False))
 
-    optimization_path = Path("data") / "optimizer_results.csv"
+    optimization_path = OUTPUT_DIR / "optimizer_results.csv"
     results_df.to_csv(optimization_path, index=False)
     print(f"\nSaved optimizer results to: {optimization_path}")
 
@@ -723,8 +904,9 @@ def main() -> None:
     print("\n===== BEST CONFIGURATION =====")
     print(best_row.to_string())
 
-    run_best_configuration(best_row)
+    print("\nRunning best configuration across all tickers...")
+    run_best_configuration(best_row, feature_store)
 
-#running the optimization can take a long time, first try next time:)
+
 if __name__ == "__main__":
     main()
